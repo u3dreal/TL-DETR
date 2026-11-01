@@ -3,10 +3,18 @@ GENERAL:
   seed: 0
 
 DATA:
-  # data path
-  split_root: F:/dataset/3DTeethLand/Split_exp
-  patch_root: F:/dataset/3DTeethLand/patches
+  # data path (macOS; original Windows paths were F:/dataset/3DTeethLand/...)
+  split_root: /Volumes/TOSHIBA_EXT/AUTO-BOLTON/data/3DTeethLand/Split_exp
+  # All 16 teeth per arch (3 203 patches). A superset of the 12 anterior teeth, so this
+  # tree serves Bolton, tip/torque for every tooth, and the cusp head in one model.
+  # `patches` (anterior only, 1 421) is kept as the smaller alternative.
+  patch_root: /Volumes/TOSHIBA_EXT/AUTO-BOLTON/data/3DTeethLand/patches_all
   # sample
+  # 5000, the paper's / TL-DETR's original setting. Measured on this machine at 5000:
+  # 2.16 GB peak MPS driver, 0.57 GB RSS, 6.18 M params - it fits in 8 GB unified memory.
+  # The kNN is O(N^2) in memory (5000 -> ~100 MB/call, 2048 -> ~17 MB).
+  # NOTE: the model's cprob_out Conv1d has in_channels == num_points, so this value is
+  # baked into the weights - changing it requires a fresh training run.
   num_points: 5000
   # augmentation
   augmentation: True
@@ -25,6 +33,13 @@ STRUCTURE:
   dropout: 0.
 
 TRAIN:
+  # 50, the paper's value. The old runs bottomed out at epoch 21-23 of 30, but that was under
+  # the OLD one-cusp supervision, so it says nothing about when a 4-5 cusp head converges -
+  # and a 50-epoch run keeps its own epoch-25 checkpoint (save_top_k=5), while a 30-epoch run
+  # cannot produce an epoch-40 one. Cost is idle overnight time (~23 h at 5000 points).
+  # OneCycleLR is built from this value, so it must match the number of epochs actually run
+  # (`epochs=args.max_epochs` in pl_model.configure_optimizers): 50 here means a real
+  # 50-epoch anneal, not 30-with-a-flag.
   max_epochs: 50
   weight_decay: 0.0001
   # batch_size per gpu
@@ -40,12 +55,15 @@ TRAIN:
   start_epoch: 0
 
   train_file: train.txt
-  train_workers: 0  # 2
+  # 0 workers: with the pressure-cached feature matrices a step is ~0.5-9 ms of data work
+  # against ~120 ms of model, so worker processes only add IPC and spawn cost (measured:
+  # 1.6 s/step with workers vs ~120 ms without, FINDINGS.md section 6).
+  train_workers: 0
 
   val_file: val.txt
-  val_workers: 0  # 2
+  val_workers: 0
 
   test_file: test.txt
-  test_workers: 0
+  test_workers: 2
 
   debug: False

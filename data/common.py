@@ -1,5 +1,5 @@
-import torch
 import numpy as np
+import torch
 
 
 def calc_features(vs, fs, fn):
@@ -14,6 +14,31 @@ def calc_features(vs, fs, fn):
     return fea
 
 
+def patch_features(mesh):
+    """Deterministic (15, F) feature matrix for a WHOLE patch, float32.
+
+    Same definition as `calc_features`, but numpy and over every face, because this is
+    what `tools/prepare_dataset.py --steps features` caches to `<t_idx>_feat.npy`.
+
+    Caching the *full* patch (not a draw of `num_points` faces) is deliberate: the random
+    face subsample in `sample_indices` is part of the augmentation, so freezing it would
+    mean training forever on one draw of 2 048 of ~8 000 faces per tooth - which also
+    fixes the decoded landmark resolution for the whole run (Agents.md section 7.2).
+    """
+    vs = np.asarray(mesh.vertices, dtype=np.float64)
+    vs = vs - vs.mean(0)                      # identical to TeethLandDataset.__getitem__
+    fs = np.asarray(mesh.faces, dtype=np.int64)
+    fn = np.asarray(mesh.face_normals, dtype=np.float64)
+
+    v = vs[fs]                                # (F, 3, 3)
+    c = v.mean(1)                             # (F, 3) face centroids
+    fea = np.empty((15, len(fs)), dtype=np.float32)
+    fea[:3, :] = c.T
+    fea[3:6, :] = fn.T
+    fea[6:15, :] = (v - c[:, None]).reshape(len(fs), -1).T
+    return fea
+
+
 def geodesic_heatmaps(geodesic_matrix, args):
     ys = []
     for i, dist in enumerate(geodesic_matrix):
@@ -22,27 +47,32 @@ def geodesic_heatmaps(geodesic_matrix, args):
     return np.asarray(ys).T
 
 
+def sample_indices(n_faces, num_points):
+    """Face indices for one sample: a random `num_points` draw, with replacement if short.
+
+    Kept in one place because two code paths use it - the mesh loader and the cached-feature
+    loader - and they must draw the same way. Short patches are padded by DUPLICATING real
+    faces (they carry their real heatmaps); the original code did the same, which is a loss
+    weighting issue, not corrupted supervision (FINDINGS.md section 9).
+    """
+    if n_faces < num_points:
+        n = n_faces
+        return np.concatenate([np.arange(n),
+                               np.random.choice(n_faces, num_points - n, replace=True)])
+    return np.random.permutation(n_faces)[:num_points]
+
+
 def sample(fs, fn, hs, num_points):  # 15xN MxN
-    # hs = hs.T
-    sample_fs = np.zeros((num_points, fs.shape[1]), dtype=int)
-    sample_fn = np.zeros((num_points, fn.shape[1]), dtype=float)
-    sample_hs = np.zeros((num_points, hs.shape[1]), dtype=float)
-
-    if len(fs) < num_points:
-        n = len(fs)
-        sample_fs[:n] = fs
-        sample_fn[:n] = fn
-        sample_hs[:n] = hs
-        idx = np.random.choice(len(fs), num_points - n, replace=True)
-        sample_fs[n:] = fs[idx]
-        sample_fn[n:] = fn[idx]
-        sample_hs[n:] = hs[idx]
-    else:
-        idx = np.random.permutation(len(fs))[:num_points]
-        sample_fs[:] = fs[idx]
-        sample_fn[:] = fn[idx]
-        sample_hs[:] = hs[idx]
-
-    return sample_fs, sample_fn, sample_hs.T
+    idx = sample_indices(len(fs), num_points)
+    return fs[idx], fn[idx], hs[idx].T
 
 
+def sample_patch(feats, heatmaps, num_points):
+    """Cached full-patch arrays -> one sample: (features (15,N), heatmaps (M,N)).
+
+    The features and the heatmaps MUST use the same face draw - two independent draws would
+    silently attach every landmark heatmap to the wrong face, which trains cleanly and is
+    wrong at inference. That is why this returns both instead of exposing the indices.
+    """
+    idx = sample_indices(feats.shape[1], num_points)
+    return np.ascontiguousarray(feats[:, idx]), heatmaps[idx].T

@@ -1,44 +1,51 @@
-import os
-import tqdm
 import click
+import tqdm
 import torch
 import trimesh
 
 from pl_model import LitModel
 from data.st_data import TeethLandDataset
 
+
 @click.command()
-@click.option('--checkpoint', type=str,
-              default='E:/code/teeth_landmark_challenge/TeethLand_1_git/runs/tooth_landmark/version_0/checkpoints/best_31.ckpt')  # saved ckpt
-@click.option('--gpus', default=1)
-def run(checkpoint, gpus):
-    model = LitModel.load_from_checkpoint(checkpoint).cuda()
-    model.eval()
+@click.option('--checkpoint', type=str, required=True,
+              help='path to a Lightning .ckpt (required; there is no baked-in default)')
+@click.option('--split-file', type=str, default='test.txt')
+@click.option('--limit', type=int, default=None, help='only visualise the first N patches')
+@click.option('--show/--no-show', default=True, help='open the trimesh viewer')
+def run(checkpoint, split_file, limit, show):
+    # device is derived from the checkpoint/model, never hardcoded
+    model = LitModel.load_from_checkpoint(checkpoint, map_location='cpu')
+    device = torch.device('mps' if torch.backends.mps.is_available() else 'cpu')
+    model = model.to(device).eval()
 
     args = model.hparams.args
-    test_file = 'test.txt'
-    dataset = TeethLandDataset(args, test_file, False)
+    dataset = TeethLandDataset(args, split_file, False)
 
-    for i in tqdm.tqdm(range(len(dataset))):
+    n = len(dataset) if limit is None else min(limit, len(dataset))
+    for i in tqdm.tqdm(range(n)):
         feats, t_idx, _, _, _ = dataset[i]
-        off_file, _, _, _ = dataset.files[i]
-        # mesh
-        print(off_file)
+        off_file = dataset.files[i][0]
+
         mesh = trimesh.load(off_file)
-        vs = mesh.vertices
-        vs_offset = vs.mean(0)
-        feats = feats.unsqueeze(0).cuda()
+        vs_offset = mesh.vertices.mean(0)
+        x = feats.unsqueeze(0).to(device)
 
-        # pred
         with torch.no_grad():
-            pts, p_labels = model.infer(feats)
-            pts = pts + vs_offset
+            # inference() returns one (points, labels) pair per batch element
+            pts, p_labels = model.infer(x)[0]
+        pts = pts + vs_offset
 
-        # continue
-        pred_pts = [trimesh.primitives.Sphere(radius=0.2, center=pt).to_mesh() for pt in pts]
-        for pt in pred_pts:
-            pt.visual.vertex_colors = (0, 255, 0, 255)
-        trimesh.Scene([mesh] + pred_pts).show()
+        print(f"{off_file}  t_idx={t_idx}  -> {len(pts)} landmarks")
+        for p, lab in zip(pts, p_labels):
+            print(f"   label {int(lab)}: {p.round(3).tolist()}")
+        if not show:
+            continue
+
+        spheres = [trimesh.primitives.Sphere(radius=0.2, center=p).to_mesh() for p in pts]
+        for s in spheres:
+            s.visual.vertex_colors = (0, 255, 0, 255)
+        trimesh.Scene([mesh] + spheres).show()
 
 
 if __name__ == "__main__":
